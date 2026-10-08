@@ -1,20 +1,25 @@
 """
-🏭 AI SOFTWARE FACTORY — نسخة احترافية كاملة في ملف واحد
-═══════════════════════════════════════════════════════════
-حوّل فكرة نصية إلى تطبيق Android حقيقي.
+🏭 AI SOFTWARE FACTORY — Termux/Linux Edition
+═══════════════════════════════════════════════════════════════════════
+Turn your idea into software — AI LOYAL Edition.
 
-المبادئ:
-  ✅ معرّفات فريدة لكل كيان (U_, P_, TX_, AI_, LOG_, B_)
-  ✅ لا ندّعي نجاح عملية لم تُنفَّذ فعليًا
-  ✅ نظام Credits + Daily Reward بتحقق سيرفر
-  ✅ عزل المشاريع حسب المالك
-  ✅ بناء APK حقيقي عبر GitHub Actions
-  ✅ لوحة أدمن + سجل تدقيق
+الميزات:
+  ✅ Setup Wizard عند أول تشغيل (توكن + ID + ربط AI/n8n)
+  ✅ تخزين آمن في ~/.ai-factory/config.json (chmod 600)
+  ✅ أوامر باسم AI LOYAL
+  ✅ بناء APK عبر GitHub Actions
+  ✅ كريدت + مكافآت + لوحة أدمن
+  ✅ شفافية كاملة: لا نجاح وهمي
+
+التشغيل:
+    python main.py           # يشغّل Setup تلقائيًا لو أول مرة
+    python main.py --reset   # يمسح الإعداد ويعيد Setup
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import getpass
 import json
 import logging
 import os
@@ -24,13 +29,12 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from dotenv import load_dotenv
 from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update,
 )
@@ -40,25 +44,262 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 
-load_dotenv()
+# ══════════════════════════════════════════════════════════════════
+# ثوابت عامة
+# ══════════════════════════════════════════════════════════════════
+
+APP_NAME = "AI LOYAL FACTORY"
+CONFIG_DIR = Path.home() / ".ai-factory"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# ألوان الطرفية
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+    BLUE = "\033[94m"
+
+
+def color(text: str, c: str) -> str:
+    return f"{c}{text}{C.RESET}"
+
+
+def banner() -> None:
+    print(color("""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║        🏭   A I   L O Y A L   F A C T O R Y   🏭             ║
+║                                                              ║
+║           Turn your idea into software.                      ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+""", C.CYAN + C.BOLD))
+
 
 # ══════════════════════════════════════════════════════════════════
-# 1) الإعدادات
+# SETUP WIZARD — أول تشغيل
+# ══════════════════════════════════════════════════════════════════
+
+def _ask(prompt: str, default: str = "", required: bool = True,
+         secret: bool = False) -> str:
+    """سؤال تفاعلي مع قيمة افتراضية وتحقق."""
+    suffix = f" {color(f'[{default}]', C.DIM)}" if default else ""
+    try:
+        if secret:
+            val = getpass.getpass(f"{color('▸', C.CYAN)} {prompt}{suffix}: ").strip()
+        else:
+            val = input(f"{color('▸', C.CYAN)} {prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(color("\n\nتم الإلغاء.", C.RED))
+        sys.exit(1)
+
+    if not val:
+        val = default
+    if required and not val:
+        print(color("  ✗ هذا الحقل مطلوب.", C.RED))
+        return _ask(prompt, default, required, secret)
+    return val
+
+
+def _ask_int(prompt: str, default: int, min_val: int = 0) -> int:
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            n = int(raw)
+            if n < min_val:
+                print(color(f"  ✗ يجب أن يكون ≥ {min_val}", C.RED))
+                continue
+            return n
+        except ValueError:
+            print(color("  ✗ رقم غير صالح.", C.RED))
+
+
+def _validate_bot_token(token: str) -> bool:
+    """شكل توكن تيليجرام: 123456:ABC-DEF..."""
+    return bool(re.match(r"^\d{6,}:[A-Za-z0-9_-]{30,}$", token))
+
+
+def _validate_admin_ids(raw: str) -> list[int]:
+    ids = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+
+def setup_wizard(force: bool = False) -> dict:
+    """يعرض معالج الإعداد التفاعلي."""
+    banner()
+    print(color("╭─ معالج الإعداد الأول ─────────────────────────────╮", C.MAGENTA))
+    print(color("│  سنقوم بإعداد المصنع خطوة بخطوة.                    │", C.MAGENTA))
+    print(color("│  الإعدادات ستُحفظ في ~/.ai-factory/config.json      │", C.MAGENTA))
+    print(color("╰────────────────────────────────────────────────────╯", C.MAGENTA))
+    print()
+
+    # ─── القسم 1: تيليجرام ───
+    print(color("①  حساب تيليجرام", C.BOLD + C.YELLOW))
+    print(color("   احصل على التوكن من @BotFather في تيليجرام.", C.DIM))
+    while True:
+        token = _ask("توكن البوت", secret=True)
+        if _validate_bot_token(token):
+            break
+        print(color("  ✗ شكل التوكن غير صحيح. مثال: 123456789:ABC...", C.RED))
+
+    print(color("\n   معرّف الأدمن (ID) — احصل عليه من @userinfobot", C.DIM))
+    while True:
+        admin_raw = _ask("معرّفات الأدمن (افصل بفواصل)", required=True)
+        ids = _validate_admin_ids(admin_raw)
+        if ids:
+            break
+        print(color("  ✗ أدخل رقمًا واحدًا على الأقل.", C.RED))
+
+    # ─── القسم 2: ربط AI (n8n) ───
+    print()
+    print(color("②  ربط الذكاء الاصطناعي (n8n Webhook)", C.BOLD + C.YELLOW))
+    print(color("   رابط الـ webhook الذي سيتولّى التحليل والتوليد.", C.DIM))
+    print(color("   مثال: https://xxx.app.n8n.cloud/webhook/xxx", C.DIM))
+    while True:
+        n8n_url = _ask("رابط n8n Webhook", required=True)
+        if n8n_url.startswith(("http://", "https://")):
+            break
+        print(color("  ✗ يجب أن يبدأ بـ http:// أو https://", C.RED))
+
+    print(color("\n   حماية الـ webhook (اختياري — Enter للتخطي)", C.DIM))
+    auth_header = _ask("اسم Header الحماية", default="", required=False)
+    auth_token = ""
+    if auth_header:
+        auth_token = _ask("قيمة التوكن", secret=True)
+
+    # ─── القسم 3: GitHub (اختياري — لبناء APK) ───
+    print()
+    print(color("③  بناء APK عبر GitHub (اختياري)", C.BOLD + C.YELLOW))
+    print(color("   اتركها فارغة لو مش عايز تفعّل بناء APK الآن.", C.DIM))
+    gh_token = _ask("GitHub Token", default="", required=False, secret=True)
+    gh_user = ""
+    gh_repo = ""
+    if gh_token:
+        gh_user = _ask("GitHub Username")
+        gh_repo = _ask("GitHub Repository")
+
+    # ─── القسم 4: النظام ───
+    print()
+    print(color("④  إعدادات النظام", C.BOLD + C.YELLOW))
+    starting_credits = _ask_int("رصيد البداية لكل مستخدم", 30, 0)
+
+    # ─── حفظ ───
+    config = {
+        "version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "telegram": {
+            "token": token,
+            "admin_ids": ids,
+        },
+        "n8n": {
+            "url": n8n_url,
+            "auth_header": auth_header,
+            "auth_token": auth_token,
+            "timeout": 120,
+        },
+        "github": {
+            "token": gh_token,
+            "user": gh_user,
+            "repo": gh_repo,
+        },
+        "system": {
+            "db_path": str(CONFIG_DIR / "factory.db"),
+            "workspaces": str(CONFIG_DIR / "workspaces"),
+            "log_level": "INFO",
+        },
+        "credits": {
+            "starting": starting_credits,
+            "cost_analysis": 2,
+            "cost_generation": 10,
+            "cost_apk_build": 15,
+            "cost_daily_reward": 5,
+        },
+    }
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except Exception:
+        pass
+
+    CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
+
+    print()
+    print(color("╭─ ✅ تم الإعداد بنجاح ─────────────────────────────╮", C.GREEN))
+    print(color(f"│  📁  {CONFIG_FILE}", C.GREEN))
+    print(color("│  🔒  صلاحيات محمية (600)", C.GREEN))
+    print(color("│", C.GREEN))
+    print(color("│  للتعديل لاحقًا:  python main.py --reset", C.GREEN))
+    print(color("╰────────────────────────────────────────────────────╯", C.GREEN))
+    print()
+    return config
+
+
+def load_config() -> dict:
+    """يحمّل الإعداد أو يشغّل Setup لو غير موجود."""
+    force = "--reset" in sys.argv or "--setup" in sys.argv
+
+    if force:
+        if CONFIG_FILE.exists():
+            confirm = input(
+                color(f"⚠️  سيتم استبدال {CONFIG_FILE}. متابعة؟ (y/N): ", C.YELLOW)
+            ).strip().lower()
+            if confirm != "y":
+                print(color("تم الإلغاء.", C.RED))
+                sys.exit(0)
+        return setup_wizard(force=True)
+
+    if not CONFIG_FILE.exists():
+        print(color("🔧 لم يتم العثور على إعداد سابق — سأشغّل معالج الإعداد.", C.YELLOW))
+        print()
+        return setup_wizard()
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        # تأكيد الحقول الأساسية
+        if not cfg.get("telegram", {}).get("token"):
+            raise ValueError("missing telegram token")
+        return cfg
+    except Exception as e:
+        print(color(f"⚠️  ملف الإعداد تالف: {e}", C.RED))
+        return setup_wizard(force=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# الإعدادات — من ملف JSON
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Config:
     token: str
     admin_ids: frozenset[int]
-    ai_key: str
-    ai_base: str
-    ai_model: str
+
+    n8n_url: str
+    n8n_auth_header: str
+    n8n_auth_token: str
+    n8n_timeout: int
+
     gh_token: str
     gh_user: str
     gh_repo: str
+
     db_path: str
     workspaces: Path
     log_level: str
+
     starting_credits: int
     cost_analysis: int
     cost_generation: int
@@ -66,33 +307,39 @@ class Config:
     cost_daily_reward: int
 
     @staticmethod
-    def load() -> "Config":
-        e = lambda k, d="": os.getenv(k, d).strip()
-        i = lambda k, d=0: int(e(k, str(d)))
-
-        admins = frozenset(
-            int(x) for x in e("ADMIN_TELEGRAM_IDS").split(",") if x.strip().isdigit()
-        )
+    def from_dict(d: dict) -> "Config":
+        tg = d.get("telegram", {})
+        n8n = d.get("n8n", {})
+        gh = d.get("github", {})
+        sys_ = d.get("system", {})
+        cr = d.get("credits", {})
         return Config(
-            token=e("TELEGRAM_BOT_TOKEN"),
-            admin_ids=admins,
-            ai_key=e("OPENAI_API_KEY"),
-            ai_base=e("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            ai_model=e("AI_MODEL", "gpt-4o-mini"),
-            gh_token=e("GITHUB_TOKEN"),
-            gh_user=e("GITHUB_USER"),
-            gh_repo=e("GITHUB_REPO"),
-            db_path=e("DATABASE_PATH", "factory.db"),
-            workspaces=Path(e("WORKSPACES_PATH", "workspaces")),
-            log_level=e("LOG_LEVEL", "INFO"),
-            starting_credits=i("STARTING_CREDITS", 30),
-            cost_analysis=i("COST_ANALYSIS", 2),
-            cost_generation=i("COST_GENERATION", 10),
-            cost_apk_build=i("COST_APK_BUILD", 15),
-            cost_daily_reward=i("COST_DAILY_REWARD", 5),
+            token=tg.get("token", ""),
+            admin_ids=frozenset(int(x) for x in tg.get("admin_ids", [])),
+            n8n_url=n8n.get("url", ""),
+            n8n_auth_header=n8n.get("auth_header", ""),
+            n8n_auth_token=n8n.get("auth_token", ""),
+            n8n_timeout=int(n8n.get("timeout", 120)),
+            gh_token=gh.get("token", ""),
+            gh_user=gh.get("user", ""),
+            gh_repo=gh.get("repo", ""),
+            db_path=sys_.get("db_path", str(CONFIG_DIR / "factory.db")),
+            workspaces=Path(sys_.get("workspaces", str(CONFIG_DIR / "workspaces"))),
+            log_level=sys_.get("log_level", "INFO"),
+            starting_credits=int(cr.get("starting", 30)),
+            cost_analysis=int(cr.get("cost_analysis", 2)),
+            cost_generation=int(cr.get("cost_generation", 10)),
+            cost_apk_build=int(cr.get("cost_apk_build", 15)),
+            cost_daily_reward=int(cr.get("cost_daily_reward", 5)),
         )
 
-CFG = Config.load()
+
+_RAW_CFG = load_config()
+CFG = Config.from_dict(_RAW_CFG)
+
+# تأكد من وجود المجلدات
+CFG.workspaces.mkdir(parents=True, exist_ok=True)
+Path(CFG.db_path).parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     format="%(asctime)s │ %(levelname)-7s │ %(name)-12s │ %(message)s",
@@ -115,7 +362,7 @@ def today() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2) قاعدة البيانات
+# قاعدة البيانات
 # ══════════════════════════════════════════════════════════════════
 
 SCHEMA = """
@@ -215,7 +462,7 @@ def audit(actor: str, action: str, target: str = "") -> None:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3) خدمات المستخدم / الكريدت / المكافآت
+# خدمات المستخدم / الكريدت / المكافآت
 # ══════════════════════════════════════════════════════════════════
 
 class Users:
@@ -278,7 +525,7 @@ class Rewards:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4) عميل AI موحّد
+# عميل n8n
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -289,71 +536,96 @@ class AIResult:
     duration_ms: int = 0
 
 
-class AIClient:
-    def __init__(self, key: str, base: str, model: str):
-        self.key = key
-        self.base = base.rstrip("/")
-        self.model = model
+class N8NClient:
+    def __init__(self, url: str, auth_header: str, auth_token: str, timeout: int):
+        self.url = url
+        self.auth_header = auth_header
+        self.auth_token = auth_token
+        self.timeout = timeout
 
     @property
     def configured(self) -> bool:
-        return bool(self.key)
+        return bool(self.url)
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.auth_header and self.auth_token:
+            h[self.auth_header] = self.auth_token
+        return h
+
+    @staticmethod
+    def _extract_text(data) -> str:
+        if isinstance(data, dict):
+            for key in ("text", "output", "response", "message", "content", "answer"):
+                v = data.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v
+            for k in ("json", "data", "result"):
+                if k in data:
+                    return N8NClient._extract_text(data[k])
+            return json.dumps(data, ensure_ascii=False)
+        if isinstance(data, list) and data:
+            return N8NClient._extract_text(data[0])
+        if isinstance(data, str):
+            return data
+        return str(data)
 
     async def complete(self, prompt: str, system: str = "",
+                       agent: str = "generic", user_id: str = "system",
                        max_tokens: int = 2000) -> AIResult:
         if not self.configured:
-            return AIResult(False, error="OPENAI_API_KEY غير مُهيّأ")
-        t0 = time.time()
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+            return AIResult(False, error="N8N URL غير مُهيّأ")
 
+        t0 = time.time()
         payload = {
-            "model": self.model,
-            "messages": messages,
+            "agent": agent,
+            "system": system,
+            "prompt": prompt,
             "max_tokens": max_tokens,
-            "temperature": 0.3,
+            "user_id": user_id,
+            "ts": utcnow(),
         }
         try:
-            async with httpx.AsyncClient(timeout=120.0) as c:
-                r = await c.post(
-                    f"{self.base}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                r = await c.post(self.url, headers=self._headers(), json=payload)
+            dur = int((time.time() - t0) * 1000)
             if r.status_code >= 400:
-                return AIResult(
-                    False, error=f"HTTP {r.status_code}: {r.text[:180]}",
-                    duration_ms=int((time.time() - t0) * 1000),
-                )
-            text = r.json()["choices"][0]["message"]["content"]
-            return AIResult(True, text, duration_ms=int((time.time() - t0) * 1000))
+                return AIResult(False, error=f"HTTP {r.status_code}: {r.text[:200]}",
+                                duration_ms=dur)
+            try:
+                data = r.json()
+                text = self._extract_text(data)
+            except Exception:
+                text = r.text
+            if not text or not text.strip():
+                return AIResult(False, error="رد فارغ من n8n", duration_ms=dur)
+            return AIResult(True, text=text, duration_ms=dur)
+        except httpx.TimeoutException:
+            return AIResult(False, error=f"انتهت المدة ({self.timeout}s)",
+                            duration_ms=int((time.time() - t0) * 1000))
         except Exception as e:
-            return AIResult(False, error=str(e)[:180],
+            return AIResult(False, error=str(e)[:200],
                             duration_ms=int((time.time() - t0) * 1000))
 
 
-AI = AIClient(CFG.ai_key, CFG.ai_base, CFG.ai_model)
+AI = N8NClient(CFG.n8n_url, CFG.n8n_auth_header, CFG.n8n_auth_token, CFG.n8n_timeout)
 
 
 async def ai_call(uid: str, agent: str, prompt: str, system: str = "",
                   max_tokens: int = 2000) -> AIResult:
-    result = await AI.complete(prompt, system, max_tokens)
+    result = await AI.complete(prompt=prompt, system=system, agent=agent,
+                               user_id=uid, max_tokens=max_tokens)
     DB.exec(
         "INSERT INTO ai_requests(ai_id, user_id, agent, model, duration_ms, "
         "status, created_at) VALUES (?,?,?,?,?,?,?)",
-        (new_id("AI"), uid, agent, AI.model, result.duration_ms,
+        (new_id("AI"), uid, agent, "n8n", result.duration_ms,
          "OK" if result.ok else "ERROR", utcnow()),
     )
     return result
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5) تكامل GitHub — بناء APK
+# تكامل GitHub
 # ══════════════════════════════════════════════════════════════════
 
 GH_API = "https://api.github.com"
@@ -449,10 +721,8 @@ class GitHubClient:
             if not main_sha:
                 return False, "لم يُعثر على فرع main أو master"
             await self._ensure_branch(c, branch, main_sha)
-
             all_files = dict(files)
             all_files[WORKFLOW_PATH] = WORKFLOW_CONTENT
-
             for path, content in all_files.items():
                 if not await self._put_file(c, branch, path, content):
                     return False, f"فشل رفع: {path}"
@@ -473,10 +743,8 @@ class GitHubClient:
     async def poll_build(self, branch: str, timeout_s: int = 900) -> dict:
         if not self.configured:
             return {"status": "error", "message": "GitHub غير مُهيّأ"}
-
         deadline = time.time() + timeout_s
         run_id = None
-
         async with httpx.AsyncClient(timeout=30.0) as c:
             while time.time() < deadline:
                 r = await c.get(self._url("/actions/runs"),
@@ -488,10 +756,8 @@ class GitHubClient:
                         run_id = runs[0]["id"]
                         break
                 await asyncio.sleep(5)
-
             if not run_id:
                 return {"status": "timeout", "message": "لم يبدأ البناء"}
-
             while time.time() < deadline:
                 r = await c.get(self._url(f"/actions/runs/{run_id}"),
                                 headers=self._headers())
@@ -507,7 +773,6 @@ class GitHubClient:
                         "html_url": data["html_url"],
                     }
                 await asyncio.sleep(15)
-
         return {"status": "timeout", "message": "انتهت المدة"}
 
 
@@ -515,7 +780,7 @@ GH = GitHubClient(CFG.gh_token, CFG.gh_user, CFG.gh_repo)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6) الوكلاء — المتطلبات + توليد Flutter
+# الوكلاء
 # ══════════════════════════════════════════════════════════════════
 
 REQ_SYSTEM = """أنت وكيل تحليل المتطلبات في مصنع برمجيات آلي.
@@ -564,13 +829,10 @@ def extract_json(text: str) -> dict | None:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-
     start = text.find("{")
     if start == -1:
         return None
-
-    depth, end, in_str, esc = 0, -1, False, False
-    for i in range(start, len(text)):
+    depth, end, in_str, esc = 0, -1, False, False    for i in range(start, len(text)):
         ch = text[i]
         if in_str:
             if esc:
@@ -589,7 +851,6 @@ def extract_json(text: str) -> dict | None:
             if depth == 0:
                 end = i + 1
                 break
-
     if end == -1:
         return None
     try:
@@ -599,7 +860,7 @@ def extract_json(text: str) -> dict | None:
 
 
 DEFAULT_PUBSPEC = """name: app
-description: Generated by AI Software Factory
+description: Generated by AI LOYAL FACTORY
 publish_to: 'none'
 version: 1.0.0+1
 environment:
@@ -625,7 +886,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AI Factory App',
+      title: 'AI LOYAL App',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.deepPurple),
       home: const HomeScreen(),
     );
@@ -639,7 +900,7 @@ class HomeScreen extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(title: const Text('My App')),
       body: const Center(
-        child: Text('تم التوليد بواسطة AI Software Factory'),
+        child: Text('Generated by AI LOYAL FACTORY'),
       ),
     );
   }
@@ -657,11 +918,9 @@ async def run_flutter_gen(uid: str, requirements: str) -> tuple[AIResult, dict]:
     result = await ai_call(uid, "coding", prompt, FLUTTER_SYSTEM, max_tokens=4000)
     if not result.ok:
         return result, {}
-
     files = extract_json(result.text)
     if not files:
-        return AIResult(False, error="فشل استخراج JSON"), {}
-
+        return AIResult(False, error="فشل استخراج JSON من الرد"), {}
     files.setdefault("pubspec.yaml", DEFAULT_PUBSPEC)
     files.setdefault("lib/main.dart", DEFAULT_MAIN)
     return result, files
@@ -680,7 +939,7 @@ def write_project_files(pid: str, files: dict[str, str]) -> Path:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7) الأزرار والقوائم
+# الأزرار والقوائم
 # ══════════════════════════════════════════════════════════════════
 
 def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
@@ -694,6 +953,7 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("⭐  رصيدي", callback_data="credits"),
             InlineKeyboardButton("📊  حالة النظام", callback_data="health"),
         ],
+        [InlineKeyboardButton("🤖  AI LOYAL", callback_data="ai_loyal")],
         [InlineKeyboardButton("❓  مساعدة", callback_data="help")],
     ]
     if is_admin:
@@ -735,16 +995,24 @@ def admin_panel() -> InlineKeyboardMarkup:
     ])
 
 
+def ai_loyal_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬  محادثة مباشرة", callback_data="loyal_chat")],
+        [InlineKeyboardButton("📖  عن AI LOYAL", callback_data="loyal_about")],
+        [InlineKeyboardButton("◀️  رجوع", callback_data="main_menu")],
+    ])
+
+
 # ══════════════════════════════════════════════════════════════════
-# 8) النصوص
+# النصوص
 # ══════════════════════════════════════════════════════════════════
 
 def welcome_text(user_row) -> str:
     badge = "👑 أدمن" if user_row["is_admin"] else "👤 مستخدم"
     return (
-        "╔══════════════════════════╗\n"
-        "║   🏭  *AI SOFTWARE FACTORY*   ║\n"
-        "╚══════════════════════════╝\n\n"
+        "╔══════════════════════════════╗\n"
+        "║   🏭  *AI LOYAL FACTORY*   ║\n"
+        "╚══════════════════════════════╝\n\n"
         "_حوّل فكرتك إلى تطبيق حقيقي_\n\n"
         f"┌ 👤 *حسابك*\n"
         f"│ المعرّف: `{user_row['user_id']}`\n"
@@ -775,13 +1043,29 @@ def help_text() -> str:
         "━━━━━━━━━━━━━━━━━━━\n"
         "*1.* اضغط *🚀 إنشاء مشروع*\n"
         "*2.* أرسل فكرتك بالعربية\n"
-        "*3.* يبدأ التحليل تلقائيًا\n"
+        "*3.* يبدأ التحليل تلقائيًا عبر AI LOYAL\n"
         "*4.* ولّد كود Flutter\n"
         "*5.* ابنِ APK حقيقي\n\n"
         "🎁 *مكافأة يومية:* كل 24 ساعة\n"
         "⭐ *الكريدت:* يُخصم عند العمليات المكلفة\n"
         "💰 *الاسترجاع:* تلقائي عند الفشل\n\n"
+        "🤖 *AI LOYAL:* مساعدك الشخصي على مدار الساعة\n\n"
         "⚠️ *شفافية:* لا ندّعي نجاح عملية لم تُنفَّذ فعليًا."
+    )
+
+
+def ai_loyal_about() -> str:
+    return (
+        "🤖 *AI LOYAL*\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "مساعدك الذكي المخلص، يعمل على مدار الساعة.\n\n"
+        "*القدرات:*\n"
+        "• فهم فكرتك وتحويلها لمشروع\n"
+        "• الإجابة عن أسئلتك التقنية\n"
+        "• اقتراح ميزات وتحسينات\n"
+        "• شرح أي جزء من مشروعك\n\n"
+        "*كيف تستخدمه؟*\n"
+        "اختر *💬 محادثة مباشرة* واكتب سؤالك."
     )
 
 
@@ -791,16 +1075,18 @@ def health_text() -> str:
         "📊 *حالة النظام*\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         f"{dot(True)} قاعدة البيانات\n"
-        f"{dot(AI.configured)} مزوّد الذكاء الاصطناعي\n"
+        f"{dot(AI.configured)} AI LOYAL (n8n)\n"
         f"{dot(GH.configured)} تكامل GitHub (لبناء APK)\n\n"
+        f"📁 البيانات: `{CONFIG_DIR}`\n\n"
         "🟢 = يعمل   🔴 = غير مُهيّأ"
     )
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9) المعالجات
+# المعالجات
 # ══════════════════════════════════════════════════════════════════
 
+# حالات المستخدمين
 PENDING: dict[int, dict] = {}
 
 
@@ -834,6 +1120,29 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(health_text(), parse_mode=ParseMode.MARKDOWN)
 
 
+async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """أمر /ai — يفتح محادثة AI LOYAL."""
+    row = _user(update)
+    PENDING[update.effective_user.id] = {"step": "loyal_chat"}
+    await update.message.reply_text(
+        "🤖 *AI LOYAL*\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "اكتب سؤالك وسأجيبك فورًا.\n\n"
+        "_يمكنك الإلغاء بـ /start_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=cancel_only(),
+    )
+
+
+async def cmd_loyal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """أمر /loyal — يعرض قائمة AI LOYAL."""
+    await update.message.reply_text(
+        "🤖 *AI LOYAL*\n_مساعدك الذكي المخلص._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ai_loyal_menu(),
+    )
+
+
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -860,6 +1169,33 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             health_text(), parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu(bool(row["is_admin"])),
+        )
+        return
+
+    # ── AI LOYAL ──
+    if data == "ai_loyal":
+        await q.edit_message_text(
+            "🤖 *AI LOYAL*\n_مساعدك الذكي المخلص._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ai_loyal_menu(),
+        )
+        return
+
+    if data == "loyal_about":
+        await q.edit_message_text(
+            ai_loyal_about(), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ai_loyal_menu(),
+        )
+        return
+
+    if data == "loyal_chat":
+        PENDING[update.effective_user.id] = {"step": "loyal_chat"}
+        await q.edit_message_text(
+            "💬 *محادثة AI LOYAL*\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "اكتب سؤالك الآن…",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_only(),
         )
         return
 
@@ -1020,7 +1356,7 @@ async def _generate_code(update, ctx, pid: str, row):
         f"⚙️ *جاري توليد كود Flutter…*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📦 `{pid}`\n"
-        f"🧠 وكيل Flutter يعمل الآن\n"
+        f"🤖 AI LOYAL يعالج الطلب\n"
         f"⏳ قد يستغرق 30-90 ثانية",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1073,11 +1409,9 @@ async def _build_apk(update, ctx, pid: str, row):
         await q.edit_message_text(
             "🔴 *بناء APK غير مُهيّأ*\n"
             "━━━━━━━━━━━━━━━━━━━\n\n"
-            "لتفعيل بناء APK، أضف في `.env`:\n"
-            "• `GITHUB_TOKEN`\n"
-            "• `GITHUB_USER`\n"
-            "• `GITHUB_REPO`\n\n"
-            "_سيبدأ العمل فورًا بعد الإعداد._",
+            "لتفعيل بناء APK، أعد تشغيل الإعداد:\n"
+            "`python main.py --reset`\n\n"
+            "وأضف بيانات GitHub.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=project_actions(pid, has_code=True),
         )
@@ -1194,9 +1528,7 @@ async def _watch_build(app, user_id: str, pid: str, branch: str, chat_id: int):
             f"📦 `{pid}`\n"
             f"🆔 Build: `B_{run_id}`\n\n"
             f"📥 *تحميل الـ APK:*\n"
-            f"[افتح صفحة البناء]({html_url}) ← ثم نزّل `app-release`\n\n"
-            f"⚠️ رابط GitHub يتطلب تسجيل دخول لتحميل الـ artifact.\n"
-            f"لمشاركة مباشرة، فعّل Object Storage (S3/R2).",
+            f"[افتح صفحة البناء]({html_url}) ← ثم نزّل `app-release`",
             parse_mode=ParseMode.MARKDOWN,
         )
         audit(user_id, "apk.success", pid)
@@ -1208,8 +1540,7 @@ async def _watch_build(app, user_id: str, pid: str, branch: str, chat_id: int):
             f"❌ *فشل بناء APK*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📦 `{pid}`\n\n"
-            f"[عرض سجل البناء]({html_url})\n"
-            f"الأسباب الشائعة: خطأ في الكود المولّد أو تبعية غير متوافقة.",
+            f"[عرض سجل البناء]({html_url})",
             parse_mode=ParseMode.MARKDOWN,
         )
         audit(user_id, "apk.failed", pid)
@@ -1228,8 +1559,8 @@ async def _admin_view(update: Update, ctx, data: str, row):
             "━━━━━━━━━━━━━━━━━━━\n"
             f"👥 المستخدمون: *{n_users}*\n"
             f"📁 المشاريع: *{n_proj}*\n"
-            f"🤖 طلبات AI: *{n_ai}* (ناجحة: {n_ok})\n\n"
-            f"{'🟢' if AI.configured else '🔴'} AI\n"
+            f"🤖 طلبات AI LOYAL: *{n_ai}* (ناجحة: {n_ok})\n\n"
+            f"{'🟢' if AI.configured else '🔴'} AI LOYAL (n8n)\n"
             f"{'🟢' if GH.configured else '🔴'} GitHub",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=admin_panel(),
@@ -1274,6 +1605,10 @@ async def _admin_view(update: Update, ctx, data: str, row):
         return
 
 
+# ══════════════════════════════════════════════════════════════════
+# استقبال النصوص — يدير كل من فكرة المشروع + AI LOYAL
+# ══════════════════════════════════════════════════════════════════
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     row = _user(update)
@@ -1283,26 +1618,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     state = PENDING.get(u.id)
-    if not state or state.get("step") != "awaiting_idea":
-        await update.message.reply_text(
-            "اختر من القائمة 👇",
-            reply_markup=main_menu(bool(row["is_admin"])),
-        )
+
+    # ── فكرة مشروع جديدة ──
+    if state and state.get("step") == "awaiting_idea":
+        await _handle_new_project(update, ctx, text, row)
         return
+
+    # ── محادثة AI LOYAL ──
+    if state and state.get("step") == "loyal_chat":
+        await _handle_loyal_chat(update, ctx, text, row)
+        return
+
+    # ── لا حالة ──
+    await update.message.reply_text(
+        "اختر من القائمة 👇",
+        reply_markup=main_menu(bool(row["is_admin"])),
+    )
+
+
+async def _handle_new_project(update, ctx, text: str, row):
+    u = update.effective_user
+    PENDING.pop(u.id, None)
 
     cost = CFG.cost_analysis
     try:
         Users.charge(row["user_id"], cost, "analysis")
     except ValueError:
-        PENDING.pop(u.id, None)
         await update.message.reply_text(
             f"💸 *رصيد غير كافٍ*\nتحتاج *{cost}* كريدت.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu(bool(row["is_admin"])),
         )
         return
-
-    PENDING.pop(u.id, None)
 
     pid = new_id("P")
     DB.exec(
@@ -1316,7 +1663,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⚙️ *جاري التحليل…*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📦 المشروع: `{pid}`\n\n"
-        f"🧠 وكيل المتطلبات يعمل الآن",
+        f"🤖 AI LOYAL يحلّل الفكرة الآن",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1334,7 +1681,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📦 `{pid}`\n\n"
             f"{result.text[:3500]}\n\n"
-            f"🤖 `{AI.model}` ⏱ {result.duration_ms}ms",
+            f"🤖 `AI LOYAL` ⏱ {result.duration_ms}ms",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=project_actions(pid, has_code=False),
         )
@@ -1353,33 +1700,88 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _handle_loyal_chat(update, ctx, text: str, row):
+    """يحوّل الرسالة إلى AI LOYAL عبر n8n."""
+    u = update.effective_user
+
+    await update.message.reply_text(
+        "🤖 _AI LOYAL يفكّر…_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    system_prompt = (
+        "أنت AI LOYAL، مساعد ذكي مخلص لمستخدم في مصنع برمجيات آلي. "
+        "أجب بالعربية بإيجاز ووضوح. اقترح حلولًا عملية."
+    )
+
+    result = await ai_call(
+        uid=row["user_id"],
+        agent="loyal_chat",
+        prompt=text,
+        system=system_prompt,
+        max_tokens=1500,
+    )
+
+    if result.ok:
+        PENDING[u.id] = {"step": "loyal_chat"}  # اسمح بالمتابعة
+        await update.message.reply_text(
+            f"🤖 *AI LOYAL*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{result.text[:3500]}\n\n"
+            f"_⏱ {result.duration_ms}ms — اكتب رسالة أخرى أو /start للخروج_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=cancel_only(),
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ *AI LOYAL غير متاح*\n\n"
+            f"السبب: {result.error}\n\n"
+            f"تأكد من إعداد n8n (`python main.py --reset`)",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(bool(row["is_admin"])),
+        )
+
+
 # ══════════════════════════════════════════════════════════════════
-# 10) الإقلاع
+# الإقلاع
 # ══════════════════════════════════════════════════════════════════
 
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "🏠 القائمة الرئيسية"),
+        BotCommand("ai", "🤖 محادثة AI LOYAL"),
+        BotCommand("loyal", "📖 قائمة AI LOYAL"),
         BotCommand("health", "📊 حالة النظام"),
     ])
 
 
+def print_status_banner() -> None:
+    print(color("━" * 62, C.CYAN))
+    print(color(f"  🏭  {APP_NAME}", C.BOLD + C.CYAN))
+    print(color("━" * 62, C.CYAN))
+    print(f"  📁 Config:   {color(str(CONFIG_FILE), C.DIM)}")
+    print(f"  💾 DB:       {color(CFG.db_path, C.DIM)}")
+    print(f"  📂 Works:    {color(str(CFG.workspaces), C.DIM)}")
+    print()
+    ok = lambda v: color("🟢", C.GREEN) if v else color("🔴", C.RED)
+    print(f"  {ok(AI.configured)}  AI LOYAL (n8n):  {color(CFG.n8n_url or '-', C.DIM)}")
+    print(f"  {ok(GH.configured)}  GitHub (APK):   "
+          f"{color(f'{CFG.gh_user}/{CFG.gh_repo}' if GH.configured else '-', C.DIM)}")
+    print(f"  {ok(True)}  Database:       {color('SQLite', C.DIM)}")
+    print(f"  {ok(True)}  Admins:         {color(str(sorted(CFG.admin_ids) or 'none'), C.DIM)}")
+    print(color("━" * 62, C.CYAN))
+    print(color("  ✓ البوت يعمل الآن. (Ctrl+C للإيقاف)", C.GREEN))
+    print(color("━" * 62, C.CYAN))
+    print()
+
+
 def main() -> None:
     if not CFG.token:
-        log.error("TELEGRAM_BOT_TOKEN غير مهيّأ — راجع .env")
+        print(color("❌ TELEGRAM_BOT_TOKEN غير مُهيّأ — أعد الإعداد:", C.RED))
+        print(color("    python main.py --reset", C.YELLOW))
         sys.exit(1)
 
-    log.info("━" * 60)
-    log.info("🏭 AI SOFTWARE FACTORY")
-    log.info("━" * 60)
-    log.info("AI Provider:  %s",
-             "🟢 configured" if AI.configured else "🔴 NOT configured")
-    log.info("GitHub:       %s",
-             "🟢 configured" if GH.configured else "🔴 NOT configured")
-    log.info("Admins:       %s", sorted(CFG.admin_ids) or "none")
-    log.info("Database:     %s", CFG.db_path)
-    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    log.info("Polling… (Ctrl+C للإيقاف)")
+    print_status_banner()
 
     app = (
         Application.builder()
@@ -1387,7 +1789,9 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("ai",     cmd_ai))
+    app.add_handler(CommandHandler("loyal",  cmd_loyal))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
